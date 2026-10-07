@@ -1,0 +1,33 @@
+services:
+  scheduler:
+    build: .
+    image: handoff-scheduler:latest
+    container_name: handoff-scheduler
+    ports:
+      # 宿主机端口可用环境变量覆盖：HOST_PORT=9090 docker compose up -d
+      - "${HOST_BIND:-127.0.0.1}:${HOST_PORT:-8080}:8080"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      DB_PATH: /data/handoff.db
+      PARTITION_COUNT: "${PARTITION_COUNT:-256}"
+      QUIET: "1"
+    volumes:
+      - handoff-data:/data
+    restart: unless-stopped
+
+  # 单次校验容器：围绕成员替换、失效确认、中断恢复运行规则测试、
+  # 镜像构建自检与 API 冒烟，以状态码退出。
+  # 用法：docker compose --profile verify run --rm verify
+  verify:
+    profiles: ["verify"]
+    build: .
+    image: handoff-scheduler:latest
+    container_name: handoff-verify
+    environment:
+      QUIET: "1"
+      SMOKE_PORT: "18080"
+    command: ["python", "verify.py"]
+
+volumes:
+  handoff-data:
