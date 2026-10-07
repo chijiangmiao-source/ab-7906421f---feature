@@ -9,6 +9,10 @@
   旧完整分配，或与已确认释放一致的中间分配。
 * 所有写接口以稳定请求标识幂等：相同请求重放首次结果；
   相同请求标识携带不同快照明确冲突。
+* 每次快照的结算回执按快照请求标识持久化：直接收敛立即给出发布代次
+  与全部目标成员；进入撤销的交接在最后一次有效确认后定格为唯一完成
+  回执，固定开始时持久化的目标与每个释放方实际确认的分区，后续代次
+  的交接不得改写历史回执。
 """""
 
 from __future__ import annotations
@@ -114,6 +118,23 @@ class Store:
                 code          INTEGER NOT NULL,
                 response_json TEXT NOT NULL,
                 created_at    TEXT NOT NULL
+            );
+
+            -- 每次快照的结算回执，按快照请求标识索引。
+            -- target_json 固定交接开始时持久化的目标；released_json 记录
+            -- 每个释放方实际确认的分区。回执一旦写库即与后续代次隔离：
+            -- 新的成员替换只新增回执行，从不改写历史回执。
+            CREATE TABLE IF NOT EXISTS receipts (
+                req_id        TEXT PRIMARY KEY,
+                snapshot_json TEXT NOT NULL,
+                target_json   TEXT NOT NULL,
+                status        TEXT NOT NULL
+                              CHECK (status IN ('stable', 'revoking', 'completed')),
+                base_epoch    INTEGER NOT NULL,
+                final_epoch   INTEGER,
+                released_json TEXT NOT NULL DEFAULT '{}',
+                created_at    TEXT NOT NULL,
+                completed_at  TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_revocations_owner ON revocations(owner);
@@ -223,6 +244,72 @@ class Store:
             ),
         )
 
+    @staticmethod
+    def _record_receipt(
+        conn: sqlite3.Connection,
+        req_id: str,
+        members: list[str],
+        target: dict[str, str],
+        base_epoch: int,
+        status: str,
+        final_epoch: int | None,
+    ) -> None:
+        """在快照落库的同一事务里创建结算回执。
+
+        ``target`` 原样固定本次开始时持久化的目标（撤销前沿或全量目标），
+        之后任何代次推进都不会再改写这一行。
+        """
+        conn.execute(
+            "INSERT INTO receipts(req_id, snapshot_json, target_json, status,"
+            " base_epoch, final_epoch, released_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, '{}', ?)",
+            (
+                req_id,
+                _canonical_json(members),
+                _canonical_json(target),
+                status,
+                base_epoch,
+                final_epoch,
+                _now(),
+            ),
+        )
+
+    @staticmethod
+    def _advance_receipt(
+        conn: sqlite3.Connection,
+        handover_req_id: str,
+        member: str,
+        parts: list[str],
+        completed: bool,
+        new_epoch: int,
+    ) -> None:
+        """把一次有效确认并入回执；仅在实际释放分区的临界区内调用。
+
+        重放、过期与被拒确认都在到达临界区之前返回，因此不会推进回执。
+        """
+        row = conn.execute(
+            "SELECT released_json FROM receipts WHERE req_id = ?",
+            (handover_req_id,),
+        ).fetchone()
+        if row is None:
+            # 历史库中交接开始于回执功能之前，没有可推进的回执。
+            return
+        released = json.loads(row["released_json"])
+        released[member] = sorted(
+            set(released.get(member, ())) | set(parts), key=_part_key
+        )
+        if completed:
+            conn.execute(
+                "UPDATE receipts SET status = 'completed', released_json = ?,"
+                " final_epoch = ?, completed_at = ? WHERE req_id = ?",
+                (_canonical_json(released), new_epoch, _now(), handover_req_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE receipts SET released_json = ? WHERE req_id = ?",
+                (_canonical_json(released), handover_req_id),
+            )
+
     def _active_handover(
         self, conn: sqlite3.Connection
     ) -> sqlite3.Row | None:
@@ -297,6 +384,53 @@ class Store:
                     {"part": p, **remaining[p]} for p in sorted(remaining)
                 ],
                 "released": [p for p in sorted(target) if p not in remaining],
+            }
+
+    def receipt_view(self, request_id: str) -> dict[str, Any] | None:
+        """按快照请求标识查询结算回执；标识不存在时返回 None。
+
+        回执内容完全来自持久化的回执行，不从当前分配或逐分区链路反推：
+        * ``stable``    直接收敛，立即给出发布代次与全部目标成员；
+        * ``revoking``  进行中，``pending`` 为仍待释放的旧成员分区，
+          ``released`` 为每个释放方已实际确认的分区；
+        * ``completed`` 唯一完成回执，固定开始时持久化的目标、各释放方
+          确认的分区与完成代次，后续交接不得混入。
+        """
+        with self._lock:
+            if not isinstance(request_id, str) or not request_id.strip():
+                return None
+            req_id = request_id.strip()
+            conn = self._conn
+            row = conn.execute(
+                "SELECT * FROM receipts WHERE req_id = ?", (req_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            status = row["status"]
+            pending: list[dict[str, str]] = []
+            if status == "revoking":
+                # 进行中的回执必然对应当前唯一活动交接；按请求标识过滤
+                # 撤销集，稳定地区分待释放与已释放，不依赖全局状态。
+                pending = [
+                    {"part": r["part"], "owner": r["owner"], "target": r["target"]}
+                    for r in conn.execute(
+                        "SELECT part, owner, target FROM revocations"
+                        " WHERE req_id = ? ORDER BY part",
+                        (req_id,),
+                    )
+                ]
+            final_epoch = row["final_epoch"]
+            epoch = int(final_epoch) if final_epoch is not None else self._epoch(conn)
+            return {
+                "request_id": req_id,
+                "status": status,
+                "epoch": epoch,
+                "members": json.loads(row["snapshot_json"]),
+                "target": json.loads(row["target_json"]),
+                "released": json.loads(row["released_json"]),
+                "pending": pending,
+                "created_at": row["created_at"],
+                "completed_at": row["completed_at"],
             }
 
     # ------------------------------------------------------------------ writes
@@ -395,6 +529,10 @@ class Store:
                         "request_id": req_id,
                         "assigned": sorted(target, key=_part_key),
                     }
+                    # 直接收敛：回执立即固定发布代次与全部目标成员。
+                    self._record_receipt(
+                        conn, req_id, ordered, target, epoch, "stable", epoch
+                    )
                     self._record(conn, req_id, "snapshot", ordered, OK, body)
                     conn.execute("COMMIT")
                     return OK, body
@@ -432,6 +570,10 @@ class Store:
                     "assigned_now": sorted(grants, key=_part_key),
                     "revocations": sorted(revokes, key=lambda x: _part_key(x["part"])),
                 }
+                # 进入撤销：回执固定本次开始时持久化的目标，完成代次待确认。
+                self._record_receipt(
+                    conn, req_id, ordered, revoke_target, epoch, "revoking", None
+                )
                 self._record(conn, req_id, "snapshot", ordered, ACCEPTED, body)
                 conn.execute("COMMIT")
                 return ACCEPTED, body
@@ -561,6 +703,13 @@ class Store:
                     status = "completed"
                 else:
                     status = "partially_released"
+
+                # 回执与交接状态在同一事务内推进：有效确认按释放方归集，
+                # 最后一次有效确认把回执定格为唯一完成回执。
+                self._advance_receipt(
+                    conn, active["req_id"], member, parts,
+                    remaining == 0, new_epoch,
+                )
 
                 body = {
                     "status": status,

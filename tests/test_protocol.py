@@ -455,6 +455,115 @@ class StoreCase(unittest.TestCase):
         self.assertEqual(body["status"], "partially_released")
         self.assertEqual(s2.assignments_view()["epoch"], 1)
 
+    # ---------------------------------------------------------- 结算回执
+
+    def test_stable_snapshot_receipt_states_epoch_and_members(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["b", "a"])
+        view = s.receipt_view("r1")
+        self.assertIsNotNone(view)
+        self.assertEqual(view["status"], "stable")
+        self.assertEqual(view["epoch"], 0)
+        self.assertEqual(view["members"], ["a", "b"])
+        self.assertEqual(
+            view["target"],
+            {str(i): ("a" if i % 2 == 0 else "b") for i in range(6)},
+        )
+        self.assertEqual(view["released"], {})
+        self.assertEqual(view["pending"], [])
+        self.assertIsNone(view["completed_at"])
+
+    def test_revoking_receipt_distinguishes_pending_and_released(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        view = s.receipt_view("r2")
+        self.assertEqual(view["status"], "revoking")
+        self.assertEqual({p["part"] for p in view["pending"]}, set("012345"))
+        self.assertEqual(view["released"], {})
+        s.confirm("c1", "a", ["0", "2", "4"])
+        view = s.receipt_view("r2")
+        self.assertEqual(view["status"], "revoking")
+        self.assertEqual(view["released"], {"a": ["0", "2", "4"]})
+        self.assertEqual(
+            {p["part"]: p["owner"] for p in view["pending"]},
+            {"1": "b", "3": "b", "5": "b"},
+        )
+        self.assertEqual(
+            {p["part"]: p["target"] for p in view["pending"]},
+            {"1": "c", "3": "c", "5": "c"},
+        )
+
+    def test_completed_receipt_fixes_target_and_releaser_parts(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        s.confirm("c1", "a", ["0", "2", "4"])
+        s.confirm("c2", "b", ["1", "3", "5"])
+        view = s.receipt_view("r2")
+        self.assertEqual(view["status"], "completed")
+        self.assertEqual(view["epoch"], 2)
+        self.assertEqual(
+            view["target"],
+            {"0": "b", "1": "c", "2": "b", "3": "c", "4": "b", "5": "c"},
+        )
+        self.assertEqual(
+            view["released"],
+            {"a": ["0", "2", "4"], "b": ["1", "3", "5"]},
+        )
+        self.assertEqual(view["pending"], [])
+        self.assertIsNotNone(view["completed_at"])
+        first = s.receipt_view("r2")
+        # 随后发起新的成员替换：旧回执不得混入后续代次
+        s.snapshot("r3", ["c", "d"])
+        again = s.receipt_view("r2")
+        self.assertEqual(again, first)
+        self.assertEqual(again["epoch"], 2)
+        self.assertEqual(s.receipt_view("r3")["status"], "revoking")
+
+    def test_receipt_not_found_and_in_progress_never_completed(self) -> None:
+        s = self.store()
+        self.assertIsNone(s.receipt_view("no-such-request"))
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        view = s.receipt_view("r2")
+        self.assertNotEqual(view["status"], "completed")
+        self.assertIsNone(view["completed_at"])
+
+    def test_rejected_or_replayed_confirms_do_not_change_receipt(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        before = s.receipt_view("r2")
+        s.confirm("x1", "c", ["0"])  # 越权
+        s.confirm("x2", "a", ["0", "9"])  # 多余分区
+        self.assertEqual(s.receipt_view("r2"), before)
+        s.confirm("c1", "a", ["0", "2", "4"])
+        mid = s.receipt_view("r2")
+        s.confirm("c1", "a", ["0", "2", "4"])  # 重放
+        self.assertEqual(s.receipt_view("r2"), mid)
+        s.confirm("c2", "b", ["1", "3", "5"])
+        done = s.receipt_view("r2")
+        s.confirm("x3", "a", ["4"])  # 已过期（无进行中交接）
+        self.assertEqual(s.receipt_view("r2"), done)
+
+    def test_receipt_survives_reopen(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        s.confirm("c1", "a", ["0", "2", "4"])
+        s.close()
+        s2 = self.store()
+        view = s2.receipt_view("r2")
+        self.assertEqual(view["status"], "revoking")
+        self.assertEqual(view["released"], {"a": ["0", "2", "4"]})
+        s2.confirm("c2", "b", ["1", "3", "5"])
+        done = s2.receipt_view("r2")
+        self.assertEqual(done["status"], "completed")
+        s2.close()
+        s3 = self.store()
+        self.assertEqual(s3.receipt_view("r2"), done)
+
     # ------------------------------------------------------------------ utils
 
     @staticmethod

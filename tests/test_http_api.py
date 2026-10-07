@@ -119,6 +119,57 @@ class HttpCase(unittest.TestCase):
         self.assertEqual(code, 409)
         self.assertEqual(body["error"], "idempotency_conflict")
 
+    def test_receipts_over_http(self) -> None:
+        code, body = request("GET", f"{self.base}/v1/receipts/ghost")
+        self.assertEqual(code, 404)
+        self.assertEqual(body["error"], "not_found")
+
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r1", "members": ["a", "b"]})
+        code, body = request("GET", f"{self.base}/v1/receipts/r1")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["status"], "stable")
+        self.assertEqual(body["epoch"], 0)
+        self.assertEqual(body["members"], ["a", "b"])
+
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r2", "members": ["b", "c"]})
+        code, body = request("GET", f"{self.base}/v1/receipts/r2")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["status"], "revoking")
+        self.assertEqual(len(body["pending"]), 6)
+        self.assertEqual(body["released"], {})
+
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c1", "member": "a", "parts": ["0", "2", "4"]})
+        code, body = request("GET", f"{self.base}/v1/receipts/r2")
+        self.assertEqual(body["status"], "revoking")
+        self.assertEqual(body["released"], {"a": ["0", "2", "4"]})
+        self.assertEqual([p["part"] for p in body["pending"]], ["1", "3", "5"])
+
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c2", "member": "b", "parts": ["1", "3", "5"]})
+        code, body = request("GET", f"{self.base}/v1/receipts/r2")
+        self.assertEqual(body["status"], "completed")
+        self.assertEqual(body["epoch"], 2)
+        self.assertEqual(body["pending"], [])
+        self.assertEqual(
+            body["released"], {"a": ["0", "2", "4"], "b": ["1", "3", "5"]}
+        )
+        self.assertEqual(
+            body["target"],
+            {"0": "b", "1": "c", "2": "b", "3": "c", "4": "b", "5": "c"},
+        )
+
+        # 完成后再交接：旧回执保持唯一完成回执，不混入新代次
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r3", "members": ["c", "d"]})
+        code, again = request("GET", f"{self.base}/v1/receipts/r2")
+        self.assertEqual(code, 200)
+        self.assertEqual(again, body)
+        code, live = request("GET", f"{self.base}/v1/receipts/r3")
+        self.assertEqual(live["status"], "revoking")
+
     def test_bad_json_and_missing_fields(self) -> None:
         req = urllib.request.Request(
             f"{self.base}/v1/snapshots",

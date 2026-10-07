@@ -5,6 +5,7 @@
 * ``GET  /healthz``                  健康检查
 * ``GET  /v1/assignments``           当前分配读模型（``?member=`` 过滤）
 * ``GET  /v1/handover``              当前交接状态
+* ``GET  /v1/receipts/{request_id}`` 按快照请求标识查询结算回执
 * ``POST /v1/snapshots``             提交成员快照 ``{request_id, members}``
 * ``POST /v1/confirms``              旧实例确认 ``{request_id, member, parts}``
 """
@@ -17,7 +18,7 @@ import signal
 import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .store import (
     BAD_REQUEST,
@@ -94,6 +95,18 @@ def create_server(
                 return
             if parsed.path == "/v1/handover":
                 self._send(OK, store.handover_view())
+                return
+            if parsed.path.startswith("/v1/receipts/"):
+                req_id = unquote(parsed.path[len("/v1/receipts/"):])
+                view = store.receipt_view(req_id)
+                if view is None:
+                    self._send(404, {
+                        "error": "not_found",
+                        "message": "该请求标识没有对应的结算回执",
+                        "request_id": req_id,
+                    })
+                else:
+                    self._send(OK, view)
                 return
             self._send(404, {"error": "not_found", "message": parsed.path})
 
