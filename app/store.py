@@ -24,6 +24,7 @@ OK = 200
 ACCEPTED = 202
 BAD_REQUEST = 400
 FORBIDDEN = 403
+NOT_FOUND = 404
 CONFLICT = 409
 SERVICE_UNAVAILABLE = 503
 
@@ -102,6 +103,24 @@ class Store:
                 target_json   TEXT NOT NULL,
                 status        TEXT NOT NULL CHECK (status IN ('pending', 'completed')),
                 result_json   TEXT,
+                created_at    TEXT NOT NULL,
+                completed_at  TEXT
+            );
+
+            -- 每次成员替换的结算回执：以快照的稳定请求标识为主键，
+            -- 随快照同事务写入；进入撤销的快照在每次有效确认时原地推进，
+            -- 完成后冻结。后续代次不改动旧行，因此凭旧标识永远查到本次结果。
+            CREATE TABLE IF NOT EXISTS handover_receipts (
+                req_id        TEXT PRIMARY KEY,
+                kind          TEXT NOT NULL CHECK (kind IN ('stable', 'revoking')),
+                snapshot_json TEXT NOT NULL,
+                target_json   TEXT NOT NULL,
+                status        TEXT NOT NULL CHECK (status IN ('pending', 'completed')),
+                begin_epoch   INTEGER NOT NULL,
+                final_epoch   INTEGER,
+                revoked_json   TEXT NOT NULL,
+                released_json TEXT NOT NULL,
+                releasers_json TEXT NOT NULL,
                 created_at    TEXT NOT NULL,
                 completed_at  TEXT
             );
@@ -238,6 +257,87 @@ class Store:
             grouped.setdefault(row["owner"], []).append(row)
         return grouped
 
+    # ----------------------------------------------------------- 结算回执写入
+
+    def _insert_receipt(
+        self,
+        conn: sqlite3.Connection,
+        req_id: str,
+        kind: str,
+        members: list[str],
+        target: dict[str, str],
+        begin_epoch: int,
+        created_at: str,
+        revoked: dict[str, dict[str, str]] | None = None,
+    ) -> None:
+        """随快照同事务写入回执。kind=stable 时回执直接完成。"""
+        if kind == "stable":
+            status, final_epoch, completed_at = "completed", begin_epoch, created_at
+        else:
+            status, final_epoch, completed_at = "pending", None, None
+        conn.execute(
+            "INSERT INTO handover_receipts(req_id, kind, snapshot_json,"
+            " target_json, status, begin_epoch, final_epoch, revoked_json,"
+            " released_json, releasers_json, created_at, completed_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                req_id,
+                kind,
+                _canonical_json(members),
+                _canonical_json(target),
+                status,
+                begin_epoch,
+                final_epoch,
+                _canonical_json(revoked if revoked is not None else {}),
+                _canonical_json([]),
+                _canonical_json({}),
+                created_at,
+                completed_at,
+            ),
+        )
+
+    def _advance_receipt(
+        self,
+        conn: sqlite3.Connection,
+        req_id: str,
+        member: str,
+        parts: list[str],
+        new_epoch: int,
+        completed: bool,
+    ) -> None:
+        """把一笔有效确认并入回执；仅由 confirm 的临界区调用。
+
+        被拒/过期确认根本不会走到这里；确认重放走 requests 重放，也不会
+        再次并入，因此回执进度只由真实的释放事务推进。
+        """
+        row = conn.execute(
+            "SELECT released_json, releasers_json FROM handover_receipts"
+            " WHERE req_id = ?",
+            (req_id,),
+        ).fetchone()
+        if row is None:
+            # 理论上不可达：active handover 必有随快照写入的回执行
+            raise StoreError("结算回执缺失，无法推进交接")
+        released: list[str] = json.loads(row["released_json"])
+        releasers: dict[str, list[str]] = json.loads(row["releasers_json"])
+        released = sorted(set(released) | set(parts), key=_part_key)
+        confirmed = sorted(set(releasers.get(member, ())) | set(parts), key=_part_key)
+        releasers[member] = confirmed
+        if completed:
+            conn.execute(
+                "UPDATE handover_receipts SET status = 'completed',"
+                " final_epoch = ?, released_json = ?, releasers_json = ?,"
+                " completed_at = ? WHERE req_id = ?",
+                (new_epoch, _canonical_json(released),
+                 _canonical_json(releasers), _now(), req_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE handover_receipts SET released_json = ?,"
+                " releasers_json = ? WHERE req_id = ?",
+                (_canonical_json(released), _canonical_json(releasers), req_id),
+            )
+
     # ------------------------------------------------------------------- reads
 
     def health(self) -> bool:
@@ -297,6 +397,85 @@ class Store:
                     {"part": p, **remaining[p]} for p in sorted(remaining)
                 ],
                 "released": [p for p in sorted(target) if p not in remaining],
+            }
+
+    def receipt_view(
+        self, raw_request_id: Any
+    ) -> tuple[int, dict[str, Any]]:
+        """按快照的稳定请求标识查询该次交接的结算回执。
+
+        回执内容全部来自随快照冻结的持久化行：直接收敛的快照立即得到完成
+        回执；进入撤销的快照在完成前为 pending，稳定区分仍待释放分区与已
+        确认释放分区；完成后内容冻结，即便随后发起新的成员替换，凭旧标识
+        也只会查到本次结果，绝不混入后续代次。
+        """
+        req_id = self._validate_request_id(raw_request_id)
+        with self._lock:
+            conn = self._conn
+            row = conn.execute(
+                "SELECT * FROM handover_receipts WHERE req_id = ?", (req_id,)
+            ).fetchone()
+            if row is None:
+                return NOT_FOUND, {
+                    "error": "receipt_not_found",
+                    "message": "未找到该请求标识对应的交接回执",
+                    "request_id": req_id,
+                }
+
+            members: list[str] = json.loads(row["snapshot_json"])
+            target: dict[str, str] = json.loads(row["target_json"])
+            released: list[str] = json.loads(row["released_json"])
+            releasers: dict[str, list[str]] = json.loads(row["releasers_json"])
+            begin_epoch = int(row["begin_epoch"])
+            base = {
+                "request_id": req_id,
+                "kind": row["kind"],
+                "members": members,
+                "targets": {p: target[p] for p in sorted(target, key=_part_key)},
+                "created_at": row["created_at"],
+            }
+
+            if row["kind"] == "stable":
+                # 直接收敛：回执立即完成，发布代次即当前代次，全部目标固定。
+                return OK, {
+                    **base,
+                    "status": "completed",
+                    "epoch": begin_epoch,
+                    "settled_at": row["completed_at"],
+                }
+
+            if row["status"] == "pending":
+                # 待释放集合由开始时冻结的撤销集合减去已确认释放分区推导，
+                # 不读取当前 revocations / assignments，因此不受后续代次影响。
+                revoked_start: dict[str, dict[str, str]] = json.loads(
+                    row["revoked_json"]
+                )
+                released_set = set(released)
+                pending_partitions = [
+                    {"part": p, **revoked_start[p]}
+                    for p in sorted(revoked_start, key=_part_key)
+                    if p not in released_set
+                ]
+                return OK, {
+                    **base,
+                    "status": "pending",
+                    "begin_epoch": begin_epoch,
+                    "pending_partitions": pending_partitions,
+                    "released": released,
+                    "confirmed": {
+                        m: releasers[m] for m in sorted(releasers)
+                    },
+                }
+
+            # 已完成：唯一完成回执，固定开始时目标与每个释放方实际确认的分区。
+            return OK, {
+                **base,
+                "status": "completed",
+                "begin_epoch": begin_epoch,
+                "final_epoch": int(row["final_epoch"]),
+                "released": released,
+                "confirmed": {m: releasers[m] for m in sorted(releasers)},
+                "settled_at": row["completed_at"],
             }
 
     # ------------------------------------------------------------------ writes
@@ -378,6 +557,12 @@ class Store:
                         )
                 # 交接前沿：仅仍需旧实例释放的分区 -> 新目标
                 revoke_target = {item["part"]: item["target"] for item in revokes}
+                # 固定本次开始时仍待释放分区的旧持有者与目标：
+                # 完成回执及后续查询都不依赖可能已被下一轮覆盖的 revocations 表。
+                revoke_start = {
+                    item["part"]: {"owner": item["owner"], "target": item["target"]}
+                    for item in revokes
+                }
 
                 for part in grants:
                     conn.execute(
@@ -396,6 +581,10 @@ class Store:
                         "assigned": sorted(target, key=_part_key),
                     }
                     self._record(conn, req_id, "snapshot", ordered, OK, body)
+                    # 直接收敛：回执随快照同事务落库，立即为完成态。
+                    self._insert_receipt(
+                        conn, req_id, "stable", ordered, target, epoch, _now()
+                    )
                     conn.execute("COMMIT")
                     return OK, body
 
@@ -433,6 +622,12 @@ class Store:
                     "revocations": sorted(revokes, key=lambda x: _part_key(x["part"])),
                 }
                 self._record(conn, req_id, "snapshot", ordered, ACCEPTED, body)
+                # 进入撤销：回执随快照同事务落库为 pending，固定开始时的目标，
+                # 随后仅凭有效确认推进，不受当前分配或后续代次影响。
+                self._insert_receipt(
+                    conn, req_id, "revoking", ordered, target, epoch, _now(),
+                    revoked=revoke_start,
+                )
                 conn.execute("COMMIT")
                 return ACCEPTED, body
             except Exception:
@@ -542,6 +737,12 @@ class Store:
                     "SELECT COUNT(*) FROM revocations"
                 ).fetchone()[0]
                 self._set_epoch(conn, new_epoch)
+
+                # 结算回执与发布同事务推进：仅记录有效确认，完成时冻结。
+                self._advance_receipt(
+                    conn, active["req_id"], member, parts, new_epoch,
+                    completed=(remaining == 0),
+                )
 
                 if remaining == 0:
                     conn.execute(

@@ -5,6 +5,7 @@
 * ``GET  /healthz``                  健康检查
 * ``GET  /v1/assignments``           当前分配读模型（``?member=`` 过滤）
 * ``GET  /v1/handover``              当前交接状态
+* ``GET  /v1/receipts?request_id=``  按快照稳定标识查询该次交接结算回执
 * ``POST /v1/snapshots``             提交成员快照 ``{request_id, members}``
 * ``POST /v1/confirms``              旧实例确认 ``{request_id, member, parts}``
 """
@@ -94,6 +95,25 @@ def create_server(
                 return
             if parsed.path == "/v1/handover":
                 self._send(OK, store.handover_view())
+                return
+            if parsed.path == "/v1/receipts":
+                query = parse_qs(parsed.query)
+                request_id = query.get("request_id", [None])[0]
+                if not request_id:
+                    self._send(
+                        BAD_REQUEST,
+                        {
+                            "error": "bad_request",
+                            "message": "缺少 request_id 查询参数",
+                        },
+                    )
+                    return
+                try:
+                    code, body = store.receipt_view(request_id)
+                except StoreError as exc:
+                    self._send(BAD_REQUEST, {"error": "bad_request", "message": str(exc)})
+                    return
+                self._send(code, body)
                 return
             self._send(404, {"error": "not_found", "message": parsed.path})
 

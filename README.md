@@ -26,6 +26,7 @@
 | GET | `/healthz` | 健康端点，200 `{"status":"ok"}` |
 | GET | `/v1/assignments[?member=]` | 当前分配读模型；`revoking` 字段标注正在撤销的目标 |
 | GET | `/v1/handover` | 当前交接：持久化目标、待撤销、已释放集合 |
+| GET | `/v1/receipts?request_id=` | 按快照稳定标识查询该次交接的**结算回执** |
 | POST | `/v1/snapshots` | `{"request_id","members"}` 提交完整成员快照 |
 | POST | `/v1/confirms` | `{"request_id","member","parts"}` 旧实例确认撤销 |
 
@@ -42,6 +43,25 @@ POST /v1/confirms  {"request_id":"c1","member":"a","parts":["0","2","4"]}  -> 20
 POST /v1/confirms  {"request_id":"c2","member":"b","parts":["1","3","5"]}  -> 200 completed, epoch 2
 # 任一请求重传（同 request_id 同体）-> 原样返回首次结果
 ```
+
+### 结算回执
+
+值班员按**快照的稳定请求标识**取得某次交接的结算回执
+（`GET /v1/receipts?request_id=<snapshot 请求标识>`），
+无需从当前分配或逐分区链路反推：
+
+* **直接收敛**的快照：回执立即可查，`status:"completed"`，
+  含发布代次 `epoch` 与全部目标成员 `targets`。
+* **进入撤销**的快照：完成前 `status:"pending"`，
+  `pending_partitions` 为仍待释放的旧成员分区（含旧持有者与目标），
+  `released` / `confirmed` 为已确认释放分区及每个释放方实际确认的分区；
+  pending 回执不会冒充完成。
+* 最后一次有效确认后产生**唯一完成回执**：固定本次开始时持久化的
+  `members` / `targets`、`begin_epoch` / `final_epoch`
+  与每个释放方实际确认的分区。即使随后发起新的成员替换，
+  凭旧标识也只会查到本次冻结的结果，不混入后续代次。
+* 标识不存在返回 `404 receipt_not_found`；确认重放、过期或被拒确认
+  都不改变回执进度。回执随快照/确认同事务持久化，服务重启后结果不变。
 
 ## 运行
 
@@ -91,5 +111,5 @@ python -m unittest discover -s tests
 app/store.py     持久化与交接协议（单事务原子发布、幂等、恢复）
 app/server.py    标准库 HTTP 服务
 verify.py        单次校验入口（规则测试 + 构建自检 + API 冒烟）
-tests/           27 个规则/HTTP 测试，含崩溃注入与跨连接并发
+tests/           36 个规则/HTTP 测试，含崩溃注入、跨连接并发与结算回执
 ```

@@ -99,6 +99,117 @@ class HttpCase(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(set(body["assignments"]), {"1", "3", "5"})
 
+    def test_receipts_endpoint_covers_full_settlement_lifecycle(self) -> None:
+        # 不存在的标识：明确未找到
+        code, body = request("GET", f"{self.base}/v1/receipts?request_id=ghost")
+        self.assertEqual(code, 404)
+        self.assertEqual(body["error"], "receipt_not_found")
+
+        # 缺少参数
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(f"{self.base}/v1/receipts", timeout=5)
+        self.assertEqual(ctx.exception.code, 400)
+
+        # 直接收敛：回执立即说明发布代次与全部目标成员
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r1", "members": ["a", "b"]})
+        code, receipt = request("GET", f"{self.base}/v1/receipts?request_id=r1")
+        self.assertEqual(code, 200)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["kind"], "stable")
+        self.assertEqual(receipt["epoch"], 0)
+        self.assertEqual(
+            receipt["targets"],
+            {"0": "a", "1": "b", "2": "a", "3": "b", "4": "a", "5": "b"},
+        )
+
+        # 进入撤销：pending 稳定区分待释放 / 已释放
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r2", "members": ["b", "c"]})
+        code, receipt = request("GET", f"{self.base}/v1/receipts?request_id=r2")
+        self.assertEqual(code, 200)
+        self.assertEqual(receipt["status"], "pending")
+        self.assertNotIn("final_epoch", receipt)
+        self.assertEqual(
+            {p["part"] for p in receipt["pending_partitions"]}, set("012345")
+        )
+        self.assertEqual(receipt["released"], [])
+
+        # 被拒确认不推进回执
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "x1", "member": "c", "parts": ["0"]})
+        code, receipt = request("GET", f"{self.base}/v1/receipts?request_id=r2")
+        self.assertEqual(receipt["released"], [])
+
+        # 部分确认
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c1", "member": "a", "parts": ["0", "2", "4"]})
+        code, receipt = request("GET", f"{self.base}/v1/receipts?request_id=r2")
+        self.assertEqual(code, 200)
+        self.assertEqual(receipt["status"], "pending")  # 不冒充完成
+        self.assertEqual(receipt["released"], ["0", "2", "4"])
+        self.assertEqual(
+            {p["part"] for p in receipt["pending_partitions"]}, {"1", "3", "5"}
+        )
+        self.assertEqual(receipt["confirmed"], {"a": ["0", "2", "4"]})
+
+        # 最后一次有效确认 -> 唯一完成回执
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c2", "member": "b", "parts": ["1", "3", "5"]})
+        code, done = request("GET", f"{self.base}/v1/receipts?request_id=r2")
+        self.assertEqual(code, 200)
+        self.assertEqual(done["status"], "completed")
+        self.assertEqual(done["begin_epoch"], 0)
+        self.assertEqual(done["final_epoch"], 2)
+        self.assertEqual(
+            done["confirmed"], {"a": ["0", "2", "4"], "b": ["1", "3", "5"]}
+        )
+
+        # 完成后再交接：旧标识不混入后续代次
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r3", "members": ["c", "d"]})
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c3", "member": "b", "parts": ["0", "2", "4"]})
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c4", "member": "c", "parts": ["1", "3", "5"]})
+        code, old = request("GET", f"{self.base}/v1/receipts?request_id=r2")
+        self.assertEqual(old, done)
+        code, newer = request("GET", f"{self.base}/v1/receipts?request_id=r3")
+        self.assertEqual(newer["status"], "completed")
+        self.assertEqual(newer["final_epoch"], 4)
+
+    def test_receipt_query_survives_server_restart(self) -> None:
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r1", "members": ["a", "b"]})
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r2", "members": ["b", "c"]})
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c1", "member": "a", "parts": ["0", "2", "4"]})
+
+        # 关闭服务进程后用同一 DB 文件重新拉起
+        self.httpd.shutdown()
+        self.thread.join()
+        self.httpd.server_close()
+        self.store.close()
+        self.httpd, self.store = create_server(
+            host="127.0.0.1", port=0, db_path=self.db, partition_count=6
+        )
+        self.port = self.httpd.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=serve_forever, args=(self.httpd,))
+        self.thread.start()
+
+        code, receipt = request("GET", f"{self.base}/v1/receipts?request_id=r2")
+        self.assertEqual(code, 200)
+        self.assertEqual(receipt["status"], "pending")
+        self.assertEqual(receipt["released"], ["0", "2", "4"])
+        self.assertEqual(
+            {p["part"] for p in receipt["pending_partitions"]}, {"1", "3", "5"}
+        )
+        code, receipt = request("GET", f"{self.base}/v1/receipts?request_id=r1")
+        self.assertEqual(code, 200)
+        self.assertEqual(receipt["status"], "completed")
+
     def test_invalid_confirmations_are_rejected(self) -> None:
         request("POST", f"{self.base}/v1/snapshots",
                 {"request_id": "r1", "members": ["a", "b"]})

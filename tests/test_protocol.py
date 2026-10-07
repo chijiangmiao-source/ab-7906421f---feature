@@ -14,8 +14,10 @@ from app.store import (
     BAD_REQUEST,
     CONFLICT,
     FORBIDDEN,
+    NOT_FOUND,
     OK,
     Store,
+    StoreError,
 )
 
 
@@ -385,6 +387,155 @@ class StoreCase(unittest.TestCase):
             {"1": "c", "3": "c", "5": "c"},
         )
 
+    # ---------------------------------------------------------- 结算回执
+
+    def test_stable_snapshot_has_immediate_completed_receipt(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        code, receipt = s.receipt_view("r1")
+        self.assertEqual(code, OK)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["kind"], "stable")
+        # 立即说明发布代次与全部目标成员
+        self.assertEqual(receipt["epoch"], 0)
+        self.assertEqual(
+            receipt["targets"],
+            {"0": "a", "1": "b", "2": "a", "3": "b", "4": "a", "5": "b"},
+        )
+        self.assertEqual(receipt["members"], ["a", "b"])
+        self.assertTrue(receipt["settled_at"])
+
+    def test_pending_receipt_distinguishes_pending_and_released_partitions(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        code, receipt = s.receipt_view("r2")
+        self.assertEqual(code, OK)
+        # 进行中的回执不得冒充完成
+        self.assertEqual(receipt["status"], "pending")
+        self.assertNotIn("final_epoch", receipt)
+        pending = {p["part"]: p for p in receipt["pending_partitions"]}
+        self.assertEqual(set(pending), set("012345"))
+        self.assertEqual(pending["0"]["owner"], "a")
+        self.assertEqual(pending["0"]["target"], "b")
+        self.assertEqual(receipt["released"], [])
+        self.assertEqual(receipt["confirmed"], {})
+
+        s.confirm("c1", "a", ["0", "2", "4"])
+        _, receipt = s.receipt_view("r2")
+        self.assertEqual(receipt["status"], "pending")
+        self.assertEqual(
+            {p["part"] for p in receipt["pending_partitions"]}, {"1", "3", "5"}
+        )
+        # 旧成员 b 的待释放分区仍然可稳定区分
+        self.assertTrue(
+            all(p["owner"] == "b" and p["target"] == "c"
+                for p in receipt["pending_partitions"])
+        )
+        self.assertEqual(receipt["released"], ["0", "2", "4"])
+        self.assertEqual(receipt["confirmed"], {"a": ["0", "2", "4"]})
+
+    def test_completed_receipt_freezes_targets_and_per_releaser_parts(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        s.confirm("c1", "a", ["0", "2", "4"])
+        s.confirm("c2", "b", ["5", "1", "3"])
+        code, receipt = s.receipt_view("r2")
+        self.assertEqual(code, OK)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["begin_epoch"], 0)
+        self.assertEqual(receipt["final_epoch"], 2)
+        # 固定本次开始时持久化的目标
+        self.assertEqual(
+            receipt["targets"],
+            {"0": "b", "1": "c", "2": "b", "3": "c", "4": "b", "5": "c"},
+        )
+        # 固定每个释放方实际确认的分区
+        self.assertEqual(
+            receipt["confirmed"],
+            {"a": ["0", "2", "4"], "b": ["1", "3", "5"]},
+        )
+        self.assertEqual(receipt["released"], ["0", "1", "2", "3", "4", "5"])
+        self.assertTrue(receipt["settled_at"])
+
+    def test_rejected_expired_and_replayed_confirms_do_not_move_receipt(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        s.confirm("c1", "a", ["0", "2", "4"])
+        # 越权、多余分区、过期（无进行中交接时另开存储校验）、重放
+        self.assertEqual(s.confirm("x1", "c", ["1"])[0], FORBIDDEN)
+        self.assertEqual(s.confirm("x2", "a", ["7"])[0], BAD_REQUEST)
+        replay = s.confirm("c1", "a", ["0", "2", "4"])
+        self.assertEqual(replay[0], OK)
+        _, receipt = s.receipt_view("r2")
+        self.assertEqual(receipt["status"], "pending")
+        self.assertEqual(receipt["released"], ["0", "2", "4"])
+        self.assertEqual(receipt["confirmed"], {"a": ["0", "2", "4"]})
+
+    def test_old_receipt_is_not_contaminated_by_later_handovers(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        s.confirm("c1", "a", ["0", "2", "4"])
+        s.confirm("c2", "b", ["1", "3", "5"])
+        _, frozen = s.receipt_view("r2")
+
+        # 完成后再次发起成员替换
+        s.snapshot("r3", ["c", "d"])
+        _, during = s.receipt_view("r2")
+        self.assertEqual(during, frozen)
+        s.confirm("c3", "b", ["0", "2", "4"])
+        s.confirm("c4", "c", ["1", "3", "5"])
+        _, after = s.receipt_view("r2")
+        # 旧标识的完成回执永不混入后续代次
+        self.assertEqual(after, frozen)
+        self.assertEqual(after["final_epoch"], 2)
+
+        _, newer = s.receipt_view("r3")
+        self.assertEqual(newer["status"], "completed")
+        self.assertEqual(newer["begin_epoch"], 2)
+        self.assertEqual(newer["final_epoch"], 4)
+        self.assertEqual(
+            newer["confirmed"],
+            {"b": ["0", "2", "4"], "c": ["1", "3", "5"]},
+        )
+
+    def test_unknown_request_id_is_explicitly_not_found(self) -> None:
+        s = self.store()
+        code, body = s.receipt_view("ghost")
+        self.assertEqual(code, NOT_FOUND)
+        self.assertEqual(body["error"], "receipt_not_found")
+        self.assertEqual(body["request_id"], "ghost")
+        with self.assertRaises(StoreError):
+            s.receipt_view("   ")
+
+    def test_receipt_survives_restart_at_every_stage(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        s.confirm("c1", "a", ["0", "2", "4"])
+        s.close()
+        s2 = self.store()
+        # 部分确认后重启：pending 回执仍稳定区分两类分区
+        _, partial = s2.receipt_view("r2")
+        self.assertEqual(partial["status"], "pending")
+        self.assertEqual(partial["released"], ["0", "2", "4"])
+        self.assertEqual(
+            {p["part"] for p in partial["pending_partitions"]}, {"1", "3", "5"}
+        )
+        s2.confirm("c2", "b", ["1", "3", "5"])
+        _, done = s2.receipt_view("r2")
+        self.assertEqual(done["status"], "completed")
+        s2.close()
+        s3 = self.store()
+        _, still = s3.receipt_view("r2")
+        self.assertEqual(still, done)
+        _, stable = s3.receipt_view("r1")
+        self.assertEqual(stable["status"], "completed")
+        self.assertEqual(stable["kind"], "stable")
+
     # ---------------------------------------------------------- 持久化恢复
 
     def test_state_survives_reopen(self) -> None:
@@ -442,6 +593,13 @@ class StoreCase(unittest.TestCase):
         self.assertEqual(view["epoch"], 0)
         self.assertEqual(s2.assignments_view()["epoch"], 1)
         self._assert_unique_ownership(s2.assignments_view())
+        # 崩溃回滚同样回滚回执推进：重启后回执如实反映已提交的那一笔
+        _, receipt = s2.receipt_view("r2")
+        self.assertEqual(receipt["status"], "pending")
+        self.assertEqual(receipt["released"], ["0", "2", "4"])
+        self.assertEqual(
+            {p["part"] for p in receipt["pending_partitions"]}, {"1", "3", "5"}
+        )
 
     def test_crash_after_commit_replays_first_result_on_restart(self) -> None:
         s = self.store()
